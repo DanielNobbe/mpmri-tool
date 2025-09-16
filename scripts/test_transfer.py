@@ -19,7 +19,7 @@ def full_pipeline():
 
 
     transfer = Transfer3D(native_img, native_seg, target_img, mode='base')
-    tgt_segm = transfer.transfer(return_image=False)
+    tgt_segm = transfer.transfer(return_image=False, debug=True)
 
     tgt_segm.save("debug/tgt_segm_3d.nii.gz")
     target_img.save("debug/tgt_img_3d.nii.gz")
@@ -56,12 +56,13 @@ def main():
     # tgt_segm.save("tgt_segm.nii.gz")
 
 
-    transfer = Transfer3D(native_img, native_seg, target_img, mode='base')
-    tgt_segm = transfer.transfer(return_image=False)
+    transfer = Transfer3D(native_img, native_seg, target_img, mode='slice-selection')
+    tgt_segm = transfer.transfer(return_image=False, debug=True)
 
-    tgt_segm.save("tgt_segm_3d.nii.gz")
-    target_img.save("tgt_img_3d.nii.gz")
+    tgt_segm.save("debug/transfer_tgt_segm_3d.nii.gz")
+    target_img.save("debug/transfer_tgt_img_3d.nii.gz")
 
 
 if __name__ == "__main__":
-    full_pipeline()
+    main()
+    # full_pipeline()
