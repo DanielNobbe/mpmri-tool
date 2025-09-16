@@ -1,0 +1,10 @@
+
+.venv
+debug/
+.DS_Store
+.vscode/
+
+
+# python stuff
+**/__pycache__/
+**.egg-info/
