@@ -4,6 +4,7 @@ from collections import defaultdict
 from ..data import RadData, get_affine_transform
 from warnings import warn
 from functools import cached_property
+import scipy.ndimage as ndi
 """
 In this file, the main function will be a transfer function, to transfer a segmentation from src to target image.
 
@@ -184,7 +185,101 @@ class TransferSlice:
         if return_image:
             return target_slice, target_segm_slice
         return target_segm_slice
+
+
+class SliceSearcher:
+    """Class to handle searching for the best matching slice in the source image for a given target slice.
     
+    Attributes:
+        source_img: RadData: The source image from which to transfer the segmentation.
+        target_img: RadData: The target image to which to transfer the segmentation.
+        source_seg: RadData: The segmentation in the source image space.
+
+    The main function called will be find_best_matching_slice(target_slice_index, neighborhood=4, method='mutual_information')
+    Which searches for the best matching slice in the source image for the given target slice index, in the
+    neighborhood of +/- neighborhood slices.
+
+    Note: Lukas used sitk image registration to align the slices before computing the similarity metric.
+    (or the similarity metric was part of the registration process). We should try this too, but first naive mutual info.
+    
+    TODO: Implement mutual information calculation (I'm not familiar with this method of MI calculation)
+    """
+    
+    def __init__(self, source_img: RadData, target_img: RadData, source_seg: RadData):
+        self.source_img = source_img
+        self.target_img = target_img
+        self.source_seg = source_seg
+
+    @staticmethod
+    def _resize_with_interpolation(arr, target_shape, order=3):
+        """Resize a 2D array to the target shape using interpolation."""
+
+        if arr.shape == target_shape:
+            return arr
+        # Calculate zoom factors for each dimension
+        zoom_factors = [t / s for t, s in zip(target_shape, arr.shape)]
+        resized_arr = ndi.zoom(arr, zoom_factors, order=order)
+        return resized_arr
+
+    def _cross_correlation(self, img1: RadData, img2: RadData) -> float:
+        """Compute the normalized cross-correlation between two images."""
+
+        # resize to smallest image
+        if img1.shape != img2.shape:
+            target_shape = (min(img1.shape[0], img2.shape[0]), min(img1.shape[1], img2.shape[1]), min(img1.shape[2], img2.shape[2]))
+            img1 = self._resize_with_interpolation(img1, target_shape)
+            img2 = self._resize_with_interpolation(img2, target_shape)
+
+        img1_mean = np.mean(img1)
+        img2_mean = np.mean(img2)
+        numerator = np.sum((img1 - img1_mean) * (img2 - img2_mean))
+        denominator = np.sqrt(np.sum((img1 - img1_mean) ** 2) * np.sum((img2 - img2_mean) ** 2))
+        if denominator == 0:
+            return 0.0
+        return numerator / denominator
+        
+    def find_best_matching_slice(self, target_slice_index: int, neighborhood: int = 4, method: str = 'correlation', debug: bool = False) -> int:
+        if not method in ['correlation']:  # 'mutual_information', 
+            raise ValueError(f"Method must be 'correlation', but is {method}")
+        
+        # Get the target slice
+        target_slice = self.target_img[:, :, target_slice_index]
+
+        # Get the corresponding slice index in the source image
+        transfer_slice = TransferSlice(self.source_img, self.source_seg, self.target_img)
+        approx_source_slice_index = transfer_slice.get_source_slice_index(target_slice_index)
+
+        # Define the search range in the source image
+        start_index = max(0, approx_source_slice_index - neighborhood)
+        end_index = min(self.source_img.shape[2] - 1, approx_source_slice_index + neighborhood)
+
+        best_score = -np.inf
+        best_slice_index = approx_source_slice_index
+        if debug:
+            scores = {}
+
+        for src_slice_index in range(start_index, end_index + 1):
+            source_slice = self.source_img[:, :, src_slice_index]
+
+            if method == 'correlation':
+                score = self._cross_correlation(source_slice, target_slice)
+
+                if debug:
+                    scores[src_slice_index] = score
+
+            if score > best_score:
+                best_score = score
+                best_slice_index = src_slice_index
+
+        if debug:
+            print(f"Best matching slice for target slice {target_slice_index} is source slice {best_slice_index} with score {best_score:.4f}")
+            if best_slice_index != approx_source_slice_index:
+                print(f"Note: This is different from the approximated source slice index {approx_source_slice_index}")
+
+            print(f"Scores for slices are between {min(scores)} and {max(scores)}")
+
+        return best_slice_index
+
 
 class Transfer3D:
     """Class to handle full-volume transfer of segmentations.
@@ -251,15 +346,16 @@ class Transfer3D:
             raise ValueError(f"Mode must be 'base' or 'slice-selection', but is {mode}")
         self.mode = mode
 
-    def transfer(self, return_image: bool = False) -> RadData:
-        if self.mode == "base":
-            return self.transfer_base(return_image=return_image)
-        elif self.mode == "slice-selection":
-            raise NotImplementedError("Slice-selection mode is not yet implemented")
+        if self.mode == "slice-selection":
+            self.slice_searcher = SliceSearcher(source_img, target_img, source_seg)
+
+    def transfer(self, return_image: bool = False, debug: bool = False) -> RadData:
+        if self.mode == "base" or self.mode == "slice-selection":
+            return self.transfer_base(return_image=return_image, debug=debug)
         else:
             raise ValueError(f"Mode must be 'base' or 'slice-selection', but is {self.mode}")
 
-    def transfer_base(self, return_image: bool = False) -> RadData:
+    def transfer_base(self, return_image: bool = False, debug: bool = False) -> RadData:
 
         """Transfer the segmentation from source to target image for all slices.
 
@@ -271,7 +367,12 @@ class Transfer3D:
 
         for target_slice_index in range(self.target_img.shape[2]):
             # Find the closest slice in the source image
-            source_slice_index = self.transfer_slice.get_source_slice_index(target_slice_index)
+            if self.mode == "base":
+                source_slice_index = self.transfer_slice.get_source_slice_index(target_slice_index)
+            elif self.mode == "slice-selection":
+                source_slice_index = self.slice_searcher.find_best_matching_slice(target_slice_index, neighborhood=4, method='correlation', debug=debug)
+            else:
+                raise ValueError(f"Mode must be 'base' or 'slice-selection', but is {self.mode}")
             # print(f"Transferring slice {target_slice_index} using source slice {source_slice_index}")
 
             if return_image:
