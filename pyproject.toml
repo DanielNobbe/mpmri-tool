@@ -1,0 +1,15 @@
+[project]
+name = "mpmri-tool"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "nibabel>=5.3.2",
+    "numpy>=2.3.3",
+    "scikit-image>=0.25.2",
+]
+
+
+[tool.uv]
+package = true
