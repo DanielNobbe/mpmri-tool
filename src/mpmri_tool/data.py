@@ -118,6 +118,16 @@ class RadData(np.ndarray):
             nifti_img = nib.Nifti1Image(self.view(np.ndarray), affine=self.affine, header=self.header)
         nib.save(nifti_img, filepath)
 
+    def to_nib(self) -> nib.nifti1.Nifti1Image:
+        """Convert the RadData to a NIfTI image.
+
+        Returns:
+            nib.nifti1.Nifti1Image: The corresponding NIfTI image.
+        """
+        if self.affine is None or self.header is None:
+            raise ValueError("Cannot convert RadData to NIfTI without affine and header information.")
+        return nib.Nifti1Image(self.view(np.ndarray), affine=self.affine, header=self.header)
+
 
 
 def get_affine_transform(source_img: RadData, target_img: RadData) -> np.ndarray:
