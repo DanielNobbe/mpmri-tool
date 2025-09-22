@@ -300,7 +300,7 @@ class Transfer3D:
 
     NOTE: Lukas uses a method from itk: sitk.ImageRegistrationMethod() which is literally built to align images from
     different sources and modalities. (including in 3D). He uses this in the slice subselection logic, seemingly
-    only to get a max and min intensity from it? That doesn't make sense at all, but this method would probably
+    only to get a max and min intensity from it? Not sure if I understand, but this method would probably
     work well to align the scans. Note that there can be deformation as well, which may allow us to deal with breathing
     and other changes.
 
