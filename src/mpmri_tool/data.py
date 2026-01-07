@@ -1,10 +1,13 @@
 import os
-from typing import Self
+from typing import Self, Literal
 from warnings import warn
 
 import numpy as np
 import nibabel as nib
 import itk
+
+
+RadDataKind = Literal['image', 'segmentation']
 
 
 class RadData(np.ndarray):
@@ -20,7 +23,24 @@ class RadData(np.ndarray):
         header: nib.Nifti1Header: The NIfTI header containing metadata.
     """
 
-    def __new__(cls, input_data: nib.nifti1.Nifti1Image | Self | np.ndarray | str | os.PathLike, slice_dim: int = 2, affine=None, header=None, as_float: bool = False) -> Self:
+    def __new__(
+            cls,
+            input_data: nib.nifti1.Nifti1Image | Self | np.ndarray | str | os.PathLike,
+            slice_dim: int = 2,
+            affine=None,
+            header=None,
+            as_float: bool = False,
+            kind: RadDataKind = "image"
+        ) -> Self:
+
+        if kind not in ['image', 'segmentation']:
+            raise ValueError(f"Invalid kind: {kind}. Must be 'image' or 'segmentation'.")
+        
+        if kind == 'segmentation' and as_float:
+            warn("as_float=True is not typical for segmentation data. Ensure this is intended.", UserWarning)
+        elif kind == 'image':
+            as_float = True  # force as_float for image data
+
         match input_data:
             case cls():
                 return input_data
@@ -33,6 +53,7 @@ class RadData(np.ndarray):
                 obj.affine = input_data.affine
                 obj.header = input_data.header
                 obj.slice_dim = slice_dim
+                obj.kind = kind
                 return obj
             case np.ndarray():
                 if affine is None or header is None:
@@ -41,10 +62,11 @@ class RadData(np.ndarray):
                 obj.affine = affine
                 obj.header = header
                 obj.slice_dim = slice_dim
+                obj.kind = kind
                 return obj
             case str() | os.PathLike():
                 nifti_img = nib.load(input_data)
-                obj = cls(nifti_img, slice_dim=slice_dim, as_float=as_float)
+                obj = cls(nifti_img, slice_dim=slice_dim, as_float=as_float, kind=kind)
                 return obj
             case _:
                 raise TypeError(f"Input must be a Nifti1Image or RadData instance, but is {type(input_data)}")
@@ -55,12 +77,13 @@ class RadData(np.ndarray):
         self.affine = getattr(obj, 'affine', None)
         self.header = getattr(obj, 'header', None)
         self.slice_dim = getattr(obj, 'slice_dim', None)
+        self.kind = getattr(obj, 'kind', 'image')
 
     def __repr__(self):
         if len(self.shape) == 0:
             # don't print affine etc for 1D outputs (e.g. max())
-            return super().__repr__()
-        return super().__repr__() + f"\nAffine:\n{self.affine}\nHeader:\n{self.header}"
+            return f"RadData object of kind {self.kind}: {super().__repr__()}"
+        return f"RadData object of kind {self.kind}: {super().__repr__()}\nAffine:\n{self.affine}\nHeader:\n{self.header}"
 
     def _get_slice_indices(self, key):
         if isinstance(key, tuple):
@@ -276,6 +299,38 @@ class RadData(np.ndarray):
         itk_image.SetDirection(itk_direction)
         
         return itk_image
+    
+    @staticmethod  # TODO: Make this into its own mixin
+    def _get_mapping_array(sample_to_target_map):
+        max_sample_value = max(sample_to_target_map.keys())
+        mapping_array = np.zeros(max_sample_value + 1, dtype=np.int32)
+        for sample_value, target_value in sample_to_target_map.items():
+            mapping_array[sample_value] = target_value
+        return mapping_array
+    
+    def map_labels(self, label_map: dict[int, int]) -> 'RadData':
+        """Map labels in the RadData according to the provided label map.
+
+        Note: only works for the 'segmentation' kind RadData. # TODO: Split into separate subclass
+        
+        Args:
+            label_map (dict[int, int]): A dictionary mapping old labels to new labels.
+        Returns:
+            RadData: A new RadData item with labels mapped.
+        """
+
+        if self.kind != 'segmentation':
+            raise ValueError("Label mapping is only supported for RadData of kind 'segmentation'.")
+        
+        mapping_array = self._get_mapping_array(label_map)
+
+        mapped_data = self.copy()
+        flat_data = mapped_data.flatten()
+        mapped_flat_data = mapping_array[flat_data]
+        mapped_data = mapped_flat_data.reshape(self.shape)
+
+        return RadData(mapped_data, slice_dim=self.slice_dim, affine=self.affine, header=self.header, kind=self.kind)
+
 
 
 
