@@ -13,6 +13,7 @@ import numpy as np
 import tempfile
 import gzip
 import shutil
+import nrrd
 
 
 class StackMisalignedError(Exception):
@@ -185,23 +186,17 @@ class Stacker:
         # save the 4D image
         itk.imwrite(img4d, filename)
 
-    def stack_to_file(self, items: list[RadData], filename: str, corners_tol: float = 1e-3, ignore_slice_mismatch: bool = False):
-        """Stack multiple RadData 3D items into a single 4D NRRD file.
+    def stack(self, items: list[RadData], corners_tol: float = 1e-3, ignore_slice_mismatch: bool = False) -> RadData:
+        """Stack multiple RadData 3D items into a single 4D RadData object.
 
-        Note that stacking to a 4D RadData object is almost trivial,
-        while we need this custom class to save it to an NRRD file
-        properly, which is not trivial. 
-        Note that it would be possible to save a 4D RadData object to
-        NRRD too using similar methods. This would use a single affine
-        matrix, which is OK if everything is resampled to the same
-        space.
+        Args:
+            items (list[RadData]): List of RadData objects, each representing a 3D image.
 
-        Args: items (list[RadData]): List of RadData objects, each representing a 3D image.
+        Returns:
+            RadData: A RadData object representing the stacked 4D image, with the new dimension being the last one.
 
+        Note: A lot of the resampling considerations done here were found by attempting to stack into an ITK VectorImage. We have since moved to saving the data as NRRD, since it makes loading the files easier.
         """
-
-        if not self._check_all_float(items):
-            raise TypeError("Not all input RadData items have float data type. We use ITK for stacking to a file, and it has static typing, so we require float64 data. Use RadData(..., as_float=True) when loading the items to ensure they have float data type.")
 
         if not self._check_shapes_match(items):
             raise ValueError("Input RadData items do not have the same shape. If shapes are close, stacking could work well with resampling. Consider resampling items before stacking, or implementing a more flexible shape check in the Stacker class.")  # e.g., allow small differences in shape and resample accordingly
@@ -241,17 +236,129 @@ class Stacker:
 
                 warn("Input RadData items have different orientations. They have been resampled to match the first item's orientation before stacking. This may not always work well if applying it to segmentation masks or other discrete images, since it uses spline interpolation. Typically, this operation only does a rotation.", UserWarning)
 
-        self._check_ext_nrrd(filename)
+        stacked = np.concatenate([item[..., np.newaxis] for item in items], axis=3)
+        stacked_affine = items[0].affine.copy()
+        header = items[0].header
+        return RadData(stacked, affine=stacked_affine, header=header)
 
-        if os.path.splitext(filename)[1] == '.gz':
-            warn("Saving stacked NRRD file with gzip compression. 3DSlicer and other tools may not be natively compatible with nrrd.gz files.", UserWarning)
-            # save temp file, then gzip it
-            with tempfile.NamedTemporaryFile(suffix='.nrrd', delete=False) as tmpfile:
-                self._stack_itk(items, tmpfile.name)
-                with open(tmpfile.name, 'rb', compressionlevel=5) as f_in:
-                    with gzip.open(filename, 'wb') as f_out:
-                        shutil.copyfileobj(f_in, f_out)
-        else:
+    def write_to_file(self, stacked_item: RadData, filename: str):
+        """Write a stacked 4D RadData item to a NRRD file.
 
-            self._stack_itk(items, filename)
+        Args:
+            stacked_item (RadData): The stacked 4D RadData object to write.
+            filename (str): The output filename.
+        """
+        # TODO: Integrate this into RadData class instead, and manage stack
+        # dim better, so that we keep the channel dim stored or always first
+
+        if not self._check_ext_nrrd(filename):
+            warn("It is recommended to save stacked 4D images in NRRD format for better compatibility.", UserWarning)
+
+        assert len(stacked_item.shape) == 4, "Input RadData item is not 4D."
+
+        # MONAI expects NRRD channels to be the first dimension, so we need to transpose
+        stacked_item = np.transpose(stacked_item, (3, 0, 1, 2))
+        # stays a RadData object
+
+        affine = stacked_item.affine
+        spacing = np.sqrt(np.sum(affine[:3, :3] ** 2, axis=0))[:3]
+        directions = affine[:3, :3] / spacing
+        origin = affine[:3, 3]
+
+        space_directions = [
+            [np.nan, np.nan, np.nan],  # No spacing in the channel dimension
+            directions[:, 0] * spacing[0],
+            directions[:, 1] * spacing[1],
+            directions[:, 2] * spacing[2],
+            # [0, 0, time_spacing] # if a sequence
+            # 'none'
+        ]
+
+        spatial_shape = stacked_item.shape[1:]
+
+        header = {
+            'space': 'right-anterior-superior',
+            'space dimension': 3,
+            'space origin': origin.tolist(),
+            'space directions': space_directions,
+            'kinds': ['list', 'domain', 'domain', 'domain'], # or vector or time
+            'sizes': spatial_shape,
+            # 'spacings': [np.nan, np.nan, np.nan, time_spacing],
+        }
+        print(f"\n\n--- Writing header {header} ---\n\n")
+
+        nrrd.write(filename, stacked_item, header)
+
+
+        
+
+    # def stack_to_file(self, items: list[RadData], filename: str, corners_tol: float = 1e-3, ignore_slice_mismatch: bool = False):
+    #     """Stack multiple RadData 3D items into a single 4D NRRD file.
+
+    #     Note that stacking to a 4D RadData object is almost trivial,
+    #     while we need this custom class to save it to an NRRD file
+    #     properly, which is not trivial. 
+    #     Note that it would be possible to save a 4D RadData object to
+    #     NRRD too using similar methods. This would use a single affine
+    #     matrix, which is OK if everything is resampled to the same
+    #     space.
+
+    #     Args: items (list[RadData]): List of RadData objects, each representing a 3D image.
+
+    #     """
+
+    #     if not self._check_all_float(items):
+    #         raise TypeError("Not all input RadData items have float data type. We use ITK for stacking to a file, and it has static typing, so we require float64 data. Use RadData(..., as_float=True) when loading the items to ensure they have float data type.")
+
+    #     if not self._check_shapes_match(items):
+    #         raise ValueError("Input RadData items do not have the same shape. If shapes are close, stacking could work well with resampling. Consider resampling items before stacking, or implementing a more flexible shape check in the Stacker class.")  # e.g., allow small differences in shape and resample accordingly
+
+    #     corners_list = [self._get_corners(item) for item in items]
+
+    #     corners_and_orientation_match = self._check_corners_match(corners_list, sort=False, tol=corners_tol)
+
+    #     if not corners_and_orientation_match:
+    #         corners_match = self._check_corners_match(corners_list, sort=True, tol=corners_tol)
+    #         if not corners_match:
+
+    #             raise StackMisalignedError("Input RadData items do not occupy the same physical space.")
+    #         else:
+
+    #             # resample all items to the first one
+
+    #             if ignore_slice_mismatch:
+    #                 # set the affine offset in z-direction to 0, so that resampling ignores slice position differences
+    #                 new_items = []
+    #                 for item in items:
+    #                     item_affine = np.eye(4)
+    #                     item_affine[:2, :2] = item.affine[:2, :2]
+    #                     item_affine[:2, 3] = item.affine[:2, 3]
+    #                     new_item = item.copy()
+    #                     new_item.affine = item_affine
+    #                     new_items.append(new_item)
+    #                 items = new_items
+                
+    #             reference_item = items[0]
+    #             resampled_items = [reference_item]
+
+    #             for item in items[1:]:
+    #                 resampled_nib = resample_from_to(item.to_nib(), reference_item.to_nib())
+    #                 resampled_items.append(RadData(resampled_nib, as_float=True))
+    #             items = resampled_items
+
+    #             warn("Input RadData items have different orientations. They have been resampled to match the first item's orientation before stacking. This may not always work well if applying it to segmentation masks or other discrete images, since it uses spline interpolation. Typically, this operation only does a rotation.", UserWarning)
+
+    #     self._check_ext_nrrd(filename)
+
+    #     if os.path.splitext(filename)[1] == '.gz':
+    #         warn("Saving stacked NRRD file with gzip compression. 3DSlicer and other tools may not be natively compatible with nrrd.gz files.", UserWarning)
+    #         # save temp file, then gzip it
+    #         with tempfile.NamedTemporaryFile(suffix='.nrrd', delete=False) as tmpfile:
+    #             self._stack_itk(items, tmpfile.name)
+    #             with open(tmpfile.name, 'rb', compressionlevel=5) as f_in:
+    #                 with gzip.open(filename, 'wb') as f_out:
+    #                     shutil.copyfileobj(f_in, f_out)
+    #     else:
+
+    #         self._stack_itk(items, filename)
         
