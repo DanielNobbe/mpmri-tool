@@ -176,8 +176,15 @@ class RadData(np.ndarray):
         
         return self[tuple(key)]
     
-    def extract_slices(self, slice_dim: int | None = None) -> list['RadData']:
-        """Extract all slices along the specified dimension or self.slice_dim."""
+    def extract_slices(self, slice_dim: int | None = None, slice_interval: int | None = None, num_slices: int | None = None) -> list['RadData']:
+        """Extract all slices along the specified dimension or self.slice_dim.
+        
+        If slice_interval is provided, extracts every slice_interval-th slice. If num_slices is provided, extracts that many slices evenly spaced along the dimension. If neither is provided, extracts all slices. 
+        """
+
+        if slice_interval is not None and num_slices is not None:
+            raise ValueError("Cannot specify both slice_interval and num_slices. Please choose one.")
+
         if slice_dim is None:
             slice_dim = self.slice_dim
         if slice_dim is None:
@@ -189,13 +196,26 @@ class RadData(np.ndarray):
         last_slice_indices[slice_dim] = self.shape[slice_dim] - 1
         last_slice_coord = nib.affines.apply_affine(self.affine, last_slice_indices)[slice_dim]
 
+        if slice_interval is not None:
+            step_size = slice_interval
+        elif num_slices is not None:
+            step_size = max(1, self.shape[slice_dim] // num_slices)
+        else:
+            step_size = 1
+
         if last_slice_coord < first_slice_coord:
             warn("Data affine indicates that slice order is descending. Slices will be extracted in descending order.")
-            slice_range = range(self.shape[slice_dim] - 1, -1, -1)
+            slice_range = range(self.shape[slice_dim] - 1, -1, -1 * step_size)
         else:
-            slice_range = range(self.shape[slice_dim])
+            slice_range = range(0, self.shape[slice_dim], step_size)
         
         slices = [self.extract_slice(i, slice_dim) for i in slice_range]  # TODO: Implement multiprocessing?
+
+        if len(slices) == 0:
+            warn("No slices were extracted. Please check your slice_interval and num_slices parameters.")
+        if num_slices is not None and len(slices) > num_slices:
+            slices = slices[:num_slices]
+            warn(f"Extracted more slices than requested num_slices={num_slices}. Returning the first {num_slices} slices.")
         return slices
     
     def to_2d(self) -> 'RadData':
