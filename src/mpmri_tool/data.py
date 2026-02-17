@@ -134,6 +134,13 @@ class RadData(np.ndarray):
             result.header = self.header
         return result
 
+    @property
+    def num_slices(self) -> int:
+        """Return the number of slices along the slice dimension."""
+        if self.slice_dim is None:
+            raise ValueError("Data does not have a defined slice dimension.")
+        return self.shape[self.slice_dim]
+
     # TODO: Add some affine handling when creating a fully new array and inserting into it
 
     def save(self, filepath: str | os.PathLike, set_nan_to_zero: bool = False):
