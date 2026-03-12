@@ -5,6 +5,7 @@ from warnings import warn
 import numpy as np
 import nibabel as nib
 import itk
+from scipy.ndimage import label as connected_components_label
 
 
 RadDataKind = Literal['image', 'segmentation']
@@ -358,6 +359,47 @@ class RadData(np.ndarray):
 
         return RadData(mapped_data, slice_dim=self.slice_dim, affine=self.affine, header=self.header, kind=self.kind)
 
+    def filter_by_label(self, label: int) -> 'RadData':
+        """Filter the RadData to only include the specified label. Will map that label to 1.
+
+        Note: only works for the 'segmentation' kind RadData. # TODO: Split into separate subclass
+        
+        Args:
+            label (int): The label to filter by.
+        """
+        if self.kind != 'segmentation':
+            raise ValueError("Label filtering is only supported for RadData of kind 'segmentation'.")
+
+        label_map = {i: (1 if i == label else 0) for i in np.unique(self)}
+        return self.map_labels(label_map)
+    
+    def _split_connected_components(self) -> 'RadData':
+        labeled_array, num_features = connected_components_label(self)
+        return RadData(labeled_array, slice_dim=self.slice_dim, affine=self.affine, header=self.header, kind=self.kind)
+    
+    def split_into_objects(self, method='connected') -> 'RadData':
+        """Split the RadData into separate objects based on the specified method.
+        Only operated on 'segmentation' kind RadData, and requires that the segmentation is binary.
+        If your segmentation is not binary, consider using filter_by_label.
+
+        Note: only works for the 'segmentation' kind RadData. # TODO: Split into separate subclass
+        
+        Args:
+            method (str): The method to use for splitting. Options are 'connected' (connected components) or 'watershed' (watershed transform).
+            
+        Returns:
+            RadData: A new RadData item with separate objects labeled with unique integers.
+        """
+
+        if self.kind != 'segmentation':
+            raise ValueError("Object splitting is only supported for RadData of kind 'segmentation'.")
+
+        if method == 'connected':
+            return self._split_connected_components()
+        elif method == 'watershed':
+            raise NotImplementedError("Watershed splitting is not yet implemented, we found out it's actually quite complex to implement it.")
+        else:
+            raise ValueError(f"Unknown splitting method: {method}")
 
 
 
