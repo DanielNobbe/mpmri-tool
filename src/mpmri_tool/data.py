@@ -1,15 +1,20 @@
 import os
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Self, Literal
 from warnings import warn
 
 import numpy as np
 import nibabel as nib
+from nibabel import processing
+from nibabel.funcs import as_closest_canonical
 import itk
 from scipy.ndimage import label as connected_components_label
 
 
 RadDataKind = Literal['image', 'segmentation']
 
+### TODO: REWRITE BASED ON TORCHIO (they implement the affine updates etc much better than I do)
 
 class RadData(np.ndarray):
     """A subclass of np.ndarray to represent radiology data.
@@ -26,12 +31,14 @@ class RadData(np.ndarray):
 
     def __new__(
             cls,
-            input_data: nib.nifti1.Nifti1Image | Self | np.ndarray | str | os.PathLike,
-            slice_dim: int = 2,
+            input_data: nib.nifti1.Nifti1Image | Self | np.ndarray | str | os.PathLike | bytes,
+            slice_dim: int | str = 2,
             affine=None,
             header=None,
             as_float: bool = False,
-            kind: RadDataKind = "image"
+            kind: RadDataKind = "image",
+            resample_to: Self | None = None,
+            tempdir: str = '/tmp'
         ) -> Self:
 
         if kind not in ['image', 'segmentation']:
@@ -46,28 +53,55 @@ class RadData(np.ndarray):
             case cls():
                 return input_data
             case nib.nifti1.Nifti1Image():
+
+                if resample_to is not None:
+                    input_data = processing.resample_from_to(input_data, (resample_to.shape, resample_to.affine), order=3 if as_float else 0)  # linear interpolation for images, nearest neighbor for segmentations
+
                 if as_float:
                     obj = np.asarray(input_data.get_fdata()).view(cls)
                 else:
                 # obj = np.asarray(input_data.get_fdata()).view(cls)
-                    obj = np.asanyarray(input_data.dataobj).view(cls)  # TODO: Should we load segm like this but images like float?
+                    obj = np.asanyarray(input_data.dataobj, dtype=int).view(cls)  # TODO: Should we load segm like this but images like float?
                 obj.affine = input_data.affine
                 obj.header = input_data.header
-                obj.slice_dim = slice_dim
+                obj.slice_dim = obj._get_slice_dim_from_name(slice_dim) if isinstance(slice_dim, str) else slice_dim
                 obj.kind = kind
                 return obj
             case np.ndarray():
                 if affine is None or header is None:
                     raise ValueError("When input_data is a numpy array, affine and header must be provided")
+                
+                if resample_to is not None:
+                    as_nifti = nib.Nifti1Image(input_data, affine=affine, header=header)
+                    as_nifti = processing.resample_from_to(as_nifti, (resample_to.shape, resample_to.affine), order=3 if as_float else 0)
+                    return cls(as_nifti, slice_dim=slice_dim, as_float=as_float, kind=kind)
+
                 obj = input_data.view(cls)
                 obj.affine = affine
                 obj.header = header
-                obj.slice_dim = slice_dim
+                obj.slice_dim = obj._get_slice_dim_from_name(slice_dim) if isinstance(slice_dim, str) else slice_dim
                 obj.kind = kind
                 return obj
             case str() | os.PathLike():
                 nifti_img = nib.load(input_data)
+                nifti_img = as_closest_canonical(nifti_img)
+                # print(f"Loaded NIfTI image from {input_data} with shape {nifti_img.shape} and affine:\n{nifti_img.affine}")
+                # ors = nib.orientations.aff2axcodes(nifti_img.affine)
+                # print(f"Image orientation (axcodes): {ors}")
+
+                if resample_to is not None:
+                    nifti_img = processing.resample_from_to(nifti_img, (resample_to.shape, resample_to.affine), order=3 if as_float else 0)  # linear interpolation for images, nearest neighbor for segmentations
+
                 obj = cls(nifti_img, slice_dim=slice_dim, as_float=as_float, kind=kind)
+                return obj
+            case bytes():
+                with NamedTemporaryFile(suffix='.nii.gz', dir=tempdir, delete=True) as tmp_file:
+                    # delete=True is essential to prevent blowup of shm
+                    # also, we can use os.unlink to ensure the file is deleted immediately after loading
+                    tmp_file.write(input_data)
+                    tmp_file.flush()
+                    obj = cls(tmp_file.name, slice_dim=slice_dim, as_float=as_float, kind=kind, resample_to=resample_to)
+                    os.unlink(tmp_file.name)  # this ensures the file is deleted on a crash
                 return obj
             case _:
                 raise TypeError(f"Input must be a Nifti1Image or RadData instance, but is {type(input_data)}")
@@ -171,7 +205,51 @@ class RadData(np.ndarray):
             raise ValueError("Cannot convert RadData to NIfTI without affine and header information.")
         return nib.Nifti1Image(self.view(np.ndarray), affine=self.affine, header=self.header)
     
-    def extract_slice(self, slice_index: int, slice_dim: int | None = None) -> 'RadData':
+    def _get_slice_dim_from_name(self, name: str) -> int:
+        """Get the slice dim from the plane name (e.g. 'axial', 'sagittal', 'coronal')."""
+        name = name.lower()
+        match name:
+            case 'axial' | 'transverse':
+                return 2
+            case 'sagittal':
+                return 0
+            case 'coronal':
+                return 1
+            case _:
+                raise ValueError(f"Unknown plane name: {name}. Expected 'axial', 'sagittal', or 'coronal'.")
+
+    def crop_to_foreground(self) -> 'RadData':
+        """Crop the RadData to the foreground (non-zero values)."""
+        foreground_mask = self != 0
+        if not np.any(foreground_mask):
+            warn("No foreground found in RadData; returning original data.")
+            return self
+        coords = np.array(np.nonzero(foreground_mask))
+        min_coords = coords.min(axis=1)
+        max_coords = coords.max(axis=1) + 1  # add 1 to include the max index
+        slices = tuple(slice(min_c, max_c) for min_c, max_c in zip(min_coords, max_coords))
+        return self[slices]
+
+    @staticmethod
+    def _orient_slice(slice_data: np.ndarray, flip: list[int], slice_dim: int) -> np.ndarray:
+        """Orient the slice data according to the specified orientation, for the purpose of creating an image.
+
+        Args:
+            slice_data (np.ndarray): The slice data to orient.
+            flip (list[int]): A list of dimensions along which to flip the data.
+            slice_dim (int): The dimension along which the slice is taken.
+
+        Returns:
+            np.ndarray: The oriented slice data.
+        """
+        # Apply flips if specified
+        for dim in flip:
+            slice_data = np.flip(slice_data, axis=dim)
+        # always transpose first and second dims to align with how screens work, where vertical is the first dim
+        slice_data = slice_data.transpose(1, 0)
+        return slice_data
+
+    def extract_slice(self, slice_index: int, slice_dim: int | None = None, flip_dims: list[int] = None, pad: int | None = None) -> 'RadData':
         """Extract a single slice along the specified dimension or self.slice_dim."""
         if slice_dim is None:
             slice_dim = self.slice_dim
@@ -182,27 +260,141 @@ class RadData(np.ndarray):
         key = [slice(None)] * self.ndim
         key[slice_dim] = slice(slice_index, slice_index + 1)  # this conserves dimension and correctly updates affine
         
-        return self[tuple(key)]
+        slice_arr = self[tuple(key)].squeeze() # remove the slice dimension
+
+        # if pad is defined, we add a padding of zeros around the slice
+        if pad is not None:
+            slice_arr = np.pad(slice_arr, pad_width=pad, mode='constant', constant_values=0)
+
+        return self._orient_slice(slice_arr, flip_dims, slice_dim)
     
-    def extract_slices(self, slice_dim: int | None = None, slice_interval: int | None = None, num_slices: int | None = None) -> list['RadData']:
+    def as_oriented_array(self, orientation: str = 'ras') -> np.ndarray:
+        """Return the data as a numpy array oriented according to the specified orientation, for the purpose of creating an image.
+
+        Args:
+            orientation (str): The orientation to use. Options are 'ras' (default), 'radiological' (i.e. looking from bottom of the feet, assuming slice axis is z axis) or 'neurological' (i.e. looking from top of the head, assuming slice axis is z axis). In the case of 'ras', the data is returned as-is, in the other cases it's transposed for orientation purposes.
+        Returns:
+            np.ndarray: The oriented data array.
+        
+        How it works:
+        see: http://www.grahamwideman.com/gw/brain/orientation/orientterms.htm#:~:text=Radiological%22%20vs%20%22Neurological%22%20Orientation%20in%20Viewers,-%22Radiological
+         - ras: return as is
+         - radiological: flip left-right (right-left from left-right), flip front-back (anterior-posterior from posterior-anterior), keep up-down (stays inferior-superior)
+         - neurological: keep left-right (stays left-right), flip front-back (anterior-posterior from posterior-anterior), 
+        """
+
+        
+    def get_orientation_config(self, orientation: str, slice_dim: int) -> dict:
+        """Get the orientation configuration for the specified orientation.
+        
+        We largely follow http://www.grahamwideman.com/gw/brain/orientation/orientterms.htm
+        for the definition of the orientations of the slices. For the slice ordering, there seem to be 
+        no standards, but we have tried to make it anatomically realistic.
+
+        Short summary:
+        Radiolocial orientation: left of patient on right side, anterior of patient on top or right,
+        always "looking from below"
+        - axial slices: (slice dim == 2)
+            ordering: iterate from feet to head (no inversion from RAS+)
+            flips: flip L/R (dim 0 of slice), flip A/P (dim 1 of slice)
+        - sagittal slices: we choose the anterior of patient on the right (arbitrary) (slice dim == 0)
+            ordering: iterate from right to left (follow graham), so invert from RAS+
+            flips: no flip for A/P (dim 0 of slice), flip I/S (dim 1 of slice)
+        - coronal slices: right on left, iterate front to back (slice dim == 1)
+            ordering: anterior to posterior, so INVERT from RAS+
+            flips: flip L/R (dim 0 of slice), flip I/S (dim 1 of slice)
+
+
+        Neurological orientation: left of patient on left side, anterior of patient on top or right,
+        always "looking from above"
+        - axial slices: (slice dim == 2)
+            ordering: iterate from head to feet (invert from RAS+)
+            flips: no flip L/R (dim 0 of slice), flip A/P (dim 1 of slice)
+        - sagittal slices: we choose the anterior of patient on the right (arbitrary) (slice dim == 0)
+            ordering: iterate from right to left (follow graham), so invert from RAS+
+            flips: no flip for A/P (dim 0 of slice), flip I/S (dim 1 of slice)
+        - coronal slices: left on left, up on top, look from back (ordering also kind of arbitrary) (slice dim == 1)
+            ordering: posterior to anterior, so follow RAS+
+            flips: no flip L/R (dim 0 of slice), flip I/S (dim 1 of slice)
+
+        We will output a dict with keys "invert ordering" (bool), "flip_dims" (list of dimensions to flip, where the dimensions are relative to the slice, so 0 is the first dim of the slice, 1 is the second dim of the slice) and "orientation_description" (a string description of the orientation for logging/debugging purposes).
+        """
+
+        match orientation, slice_dim:
+            case 'ras', _:
+                return {
+                    "invert_ordering": False,
+                    "flip_dims": [],
+                    "orientation_description": "RAS orientation: no flips, no inversion, standard radiological orientation for axial slices, but not for sagittal and coronal slices."
+                }
+            case 'radiological', 2: # axial
+                return {
+                    "invert_ordering": False,
+                    "flip_dims": [0, 1],
+                    "orientation_description": "Radiological orientation for axial slices: left of patient on right side, anterior of patient on top or right, always looking from below. Flips: flip L/R (dim 0 of slice), flip A/P (dim 1 of slice). No inversion from RAS+."
+                }
+            case 'radiological', 0: # sagittal
+                return {
+                    "invert_ordering": True,
+                    "flip_dims": [1],
+                    "orientation_description": "Radiological orientation for sagittal slices: we choose the anterior of patient on the right (arbitrary). Ordering: iterate from right to left, so invert from RAS+. Flips: no flip for A/P (dim 0 of slice), flip I/S (dim 1 of slice)."
+                }
+            case 'radiological', 1: # coronal
+                return {
+                    "invert_ordering": True,
+                    "flip_dims": [0, 1],
+                    "orientation_description": "Radiological orientation for coronal slices: right on left, iterate front to back. Ordering: anterior to posterior, so INVERT from RAS+. Flips: flip L/R (dim 0 of slice), flip I/S (dim 1 of slice)."
+                }
+            case 'neurological', 2: # axial
+                return {
+                    "invert_ordering": True,
+                    "flip_dims": [1],
+                    "orientation_description": "Neurological orientation for axial slices: left of patient on left side, anterior of patient on top or right, always looking from above. Flips: no flip L/R (dim 0 of slice), flip A/P (dim 1 of slice). Ordering: iterate from head to feet, so invert from RAS+."
+                }
+            case 'neurological', 0: # sagittal
+                return {
+                    "invert_ordering": True,
+                    "flip_dims": [1],
+                    "orientation_description": "Neurological orientation for sagittal slices: we choose the anterior of patient on the right (arbitrary). Ordering: iterate from right to left, so invert from RAS+. Flips: no flip for A/P (dim 0 of slice), flip I/S (dim 1 of slice)."
+                }
+            case 'neurological', 1: # coronal
+                return {
+                    "invert_ordering": False,
+                    "flip_dims": [1],
+                    "orientation_description": "Neurological orientation for coronal slices: left on left, up on top, look from back (ordering also kind of arbitrary). Ordering: posterior to anterior, so follow RAS+. Flips: no flip L/R (dim 0 of slice), flip I/S (dim 1 of slice)."
+                }
+            case _:
+                raise ValueError(f"Unknown orientation {orientation} or invalid slice_dim {slice_dim} for orientation.")  
+    
+    def extract_slices(self, slice_dim: int | str | None = None, slice_interval: int | None = None, num_slices: int | None = None, orientation: str = 'ras', pad: int | None = None, skip_outer_slices: bool = False) -> list['RadData']:
         """Extract all slices along the specified dimension or self.slice_dim.
+
+        Args:
+            orientation (str): The output orientation of the slices. Options are 'ras' (default),
+                'radiological' (i.e. looking from bottom of the feet, assuming slice axis is z axis) or
+                'neurological' (i.e. looking from top of the head, assuming slice axis is z axis).
+                Note that currently, the orientation only affects the slices themselves, not their
+                ordering.
         
         If slice_interval is provided, extracts every slice_interval-th slice. If num_slices is provided, extracts that many slices evenly spaced along the dimension. If neither is provided, extracts all slices. 
+        In RAS orientation, the slices are ordered from inferior to superior.
+
         """
 
         if slice_interval is not None and num_slices is not None:
             raise ValueError("Cannot specify both slice_interval and num_slices. Please choose one.")
 
-        if slice_dim is None:
+        if isinstance(slice_dim, str):
+            slice_dim = self._get_slice_dim_from_name(slice_dim)
+        elif slice_dim is None:
+            if self.slice_dim is None:
+                raise ValueError("Data does not have a defined slice dimension. Please specify slice_dim.")
             slice_dim = self.slice_dim
-        if slice_dim is None:
-            raise ValueError("Data does not have a defined slice dimension.")
-        
-        # always slice from low to high z coordinate
-        first_slice_coord = nib.affines.apply_affine(self.affine, [0, 0, 0])[slice_dim]
-        last_slice_indices = [0] * self.ndim
-        last_slice_indices[slice_dim] = self.shape[slice_dim] - 1
-        last_slice_coord = nib.affines.apply_affine(self.affine, last_slice_indices)[slice_dim]
+
+        orientation_config = self.get_orientation_config(orientation, slice_dim)
+
+        # if num_slices is not None and skip_outer_slices:
+        #     num_slices += 2  # we will later remove the first and last slice, so we need to extract 2 extra slices to account for this
 
         if slice_interval is not None:
             step_size = slice_interval
@@ -211,19 +403,24 @@ class RadData(np.ndarray):
         else:
             step_size = 1
 
-        if last_slice_coord < first_slice_coord:
-            warn("Data affine indicates that slice order is descending. Slices will be extracted in descending order.")
-            slice_range = range(self.shape[slice_dim] - 1, -1, -1 * step_size)
+        if orientation_config["invert_ordering"]:
+            slice_start = self.shape[slice_dim] - 1 if not skip_outer_slices else self.shape[slice_dim] - 1 - step_size
+            slice_end = -1 if not skip_outer_slices else -1 + step_size
+            slice_range = range(slice_start, slice_end, -1 * step_size)
         else:
-            slice_range = range(0, self.shape[slice_dim], step_size)
+            slice_start = 0 if not skip_outer_slices else step_size
+            slice_end = self.shape[slice_dim] if not skip_outer_slices else self.shape[slice_dim] - step_size
+            slice_range = range(slice_start, slice_end, step_size)
         
-        slices = [self.extract_slice(i, slice_dim) for i in slice_range]  # TODO: Implement multiprocessing?
+        slices = [self.extract_slice(i, slice_dim, orientation_config["flip_dims"]) for i in slice_range]  # TODO: Implement multiprocessing?
 
         if len(slices) == 0:
             warn("No slices were extracted. Please check your slice_interval and num_slices parameters.")
         if num_slices is not None and len(slices) > num_slices:
+            warn(f"Extracted more slices than requested num_slices={num_slices}. Returning the first {num_slices} slices (out of {len(slices)}).")
             slices = slices[:num_slices]
-            warn(f"Extracted more slices than requested num_slices={num_slices}. Returning the first {num_slices} slices.")
+
+        
         return slices
     
     def to_2d(self) -> 'RadData':
@@ -261,14 +458,15 @@ class RadData(np.ndarray):
     #     """
     #     return stack([self] + other_items, dim=dim)
     
-    def normalize(self, method: str = 'mean-std') -> 'RadData':
+    def normalize(self, method: str = 'mean-std', rescale: float | int | None = None) -> 'RadData':
         """Normalize the RadData using the specified method.
 
         Note: Does not operate in-place; returns a new RadData item.
         
         Args:
             method (str): Normalization method. Options are 'mean-std' or 'min-max'.
-        
+            rescale (float | int | None): Factor by which to rescale the normalized data.
+
         Returns:
             RadData: Normalized RadData item.
         """
@@ -283,6 +481,13 @@ class RadData(np.ndarray):
         else:
             raise ValueError(f"Unknown normalization method: {method}")
         
+        if rescale is not None:
+            normalized_data *= rescale
+
+            # also cast to type of rescale if rescale is int or float
+            if isinstance(rescale, int | float):
+                normalized_data = normalized_data.astype(type(rescale))
+
         return RadData(normalized_data, slice_dim=self.slice_dim, affine=self.affine, header=self.header)
     
     def to_itk(self) -> itk.ImageBase:
@@ -359,18 +564,21 @@ class RadData(np.ndarray):
 
         return RadData(mapped_data, slice_dim=self.slice_dim, affine=self.affine, header=self.header, kind=self.kind)
 
-    def filter_by_label(self, label: int) -> 'RadData':
-        """Filter the RadData to only include the specified label. Will map that label to 1.
+    def filter_by_label(self, label: int | list[int]) -> 'RadData':
+        """Filter the RadData to only include the specified label(s). Will map the label(s) to 1 and all other values to 0.
 
         Note: only works for the 'segmentation' kind RadData. # TODO: Split into separate subclass
         
         Args:
-            label (int): The label to filter by.
+            label (int | list[int]): The label(s) to filter by.
         """
         if self.kind != 'segmentation':
             raise ValueError("Label filtering is only supported for RadData of kind 'segmentation'.")
 
-        label_map = {i: (1 if i == label else 0) for i in np.unique(self)}
+        if isinstance(label, int):
+            label = {label}
+
+        label_map = {i.item(): (1 if i in label else 0) for i in self.unique()}  # TODO: Stop wrapping the numpy array, or fix the slicing behaviour for low-level functions
         return self.map_labels(label_map)
     
     def _split_connected_components(self) -> 'RadData':
@@ -400,6 +608,11 @@ class RadData(np.ndarray):
             raise NotImplementedError("Watershed splitting is not yet implemented, we found out it's actually quite complex to implement it.")
         else:
             raise ValueError(f"Unknown splitting method: {method}")
+
+    def unique(self, *args, **kwargs):
+        """Return the unique values in the RadData, similar to np.unique."""
+        return np.unique(self.view(np.ndarray), *args, **kwargs)
+
 
 
 
