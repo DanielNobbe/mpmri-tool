@@ -38,7 +38,8 @@ class RadData(np.ndarray):
             as_float: bool = False,
             kind: RadDataKind = "image",
             resample_to: Self | None = None,
-            tempdir: str = '/tmp'
+            tempdir: str = '/tmp',
+            disable_canonical: bool = False
         ) -> Self:
 
         if kind not in ['image', 'segmentation']:
@@ -74,6 +75,7 @@ class RadData(np.ndarray):
                 if resample_to is not None:
                     as_nifti = nib.Nifti1Image(input_data, affine=affine, header=header)
                     as_nifti = processing.resample_from_to(as_nifti, (resample_to.shape, resample_to.affine), order=3 if as_float else 0)
+                    # as_nifti.set_sform
                     return cls(as_nifti, slice_dim=slice_dim, as_float=as_float, kind=kind)
 
                 obj = input_data.view(cls)
@@ -84,7 +86,8 @@ class RadData(np.ndarray):
                 return obj
             case str() | os.PathLike():
                 nifti_img = nib.load(input_data)
-                nifti_img = as_closest_canonical(nifti_img)
+                if not disable_canonical:
+                    nifti_img = as_closest_canonical(nifti_img)
                 # print(f"Loaded NIfTI image from {input_data} with shape {nifti_img.shape} and affine:\n{nifti_img.affine}")
                 # ors = nib.orientations.aff2axcodes(nifti_img.affine)
                 # print(f"Image orientation (axcodes): {ors}")
@@ -100,8 +103,8 @@ class RadData(np.ndarray):
                     # also, we can use os.unlink to ensure the file is deleted immediately after loading
                     tmp_file.write(input_data)
                     tmp_file.flush()
-                    obj = cls(tmp_file.name, slice_dim=slice_dim, as_float=as_float, kind=kind, resample_to=resample_to)
-                    os.unlink(tmp_file.name)  # this ensures the file is deleted on a crash
+                    obj = cls(tmp_file.name, slice_dim=slice_dim, as_float=as_float, kind=kind, resample_to=resample_to, disable_canonical=disable_canonical)
+                    # os.unlink(tmp_file.name)  # this ensures the file is deleted on a crash
                 return obj
             case _:
                 raise TypeError(f"Input must be a Nifti1Image or RadData instance, but is {type(input_data)}")
@@ -191,8 +194,13 @@ class RadData(np.ndarray):
             data_to_save = self.copy()
             data_to_save[np.isnan(data_to_save)] = 0
             nifti_img = nib.Nifti1Image(data_to_save.view(np.ndarray), affine=self.affine, header=self.header)
+            nifti_img.set_sform(self.affine, code=1)
+            nifti_img.set_qform(self.affine, code=1)
         else:
             nifti_img = nib.Nifti1Image(self.view(np.ndarray), affine=self.affine, header=self.header)
+            nifti_img.set_sform(self.affine, code=1)
+            nifti_img.set_qform(self.affine, code=1)
+            # print(f"Saving with header {nifti_img.header}")
         nib.save(nifti_img, filepath)
 
     def to_nib(self) -> nib.nifti1.Nifti1Image:
@@ -534,9 +542,9 @@ class RadData(np.ndarray):
         return itk_image
     
     @staticmethod  # TODO: Make this into its own mixin
-    def _get_mapping_array(sample_to_target_map):
-        max_sample_value = max(sample_to_target_map.keys())
-        mapping_array = np.zeros(max_sample_value + 1, dtype=np.int32)
+    def _get_mapping_array(sample_to_target_map, max_sample_value=None):
+        max_input_value = max(max(sample_to_target_map.keys()), max_sample_value or 0)
+        mapping_array = np.zeros(max_input_value + 1, dtype=np.int32)
         for sample_value, target_value in sample_to_target_map.items():
             mapping_array[sample_value] = target_value
         return mapping_array
@@ -554,8 +562,9 @@ class RadData(np.ndarray):
 
         if self.kind != 'segmentation':
             raise ValueError("Label mapping is only supported for RadData of kind 'segmentation'.")
-        
-        mapping_array = self._get_mapping_array(label_map)
+
+        max_sample_value = int(np.max(self))
+        mapping_array = self._get_mapping_array(label_map, max_sample_value)
 
         mapped_data = self.copy()
         flat_data = mapped_data.flatten()
